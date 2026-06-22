@@ -1,0 +1,8 @@
+{
+  "name": "hyperframes-render-server",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@hyperframes/producer": "latest"
+  }
+}
