@@ -12,9 +12,9 @@ mkdirSync(CUT_DIR, { recursive: true });
 // token → absolute file path for cut videos
 const cutStore = new Map();
 
-// ─── Start HyperFrames internally ────────────────────────────────────────────
+// ─── Start HyperFrames internally (fire-and-forget — it's a blocking server loop) ──
 console.log('[HF] Starting HyperFrames on internal port', HF_PORT);
-startServer({ port: HF_PORT }).catch(err => console.error('[HF Error]', err));
+startServer({ port: HF_PORT });   // no await, no .catch — runs concurrently
 
 // Give HyperFrames ~3 s to boot before we start proxying
 await Bun.sleep(3000);
