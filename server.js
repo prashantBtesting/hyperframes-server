@@ -78,7 +78,7 @@ async function handleFFmpegCut(req) {
 // ─── Public server (proxy + /ffmpeg-cut + /cut-outputs/:token) ───────────────
 Bun.serve({
   port: PORT,
-  idleTimeout: 600,   // 10 min for long renders / cuts
+  idleTimeout: 255,   // Bun max (255s)
 
   async fetch(req) {
     const url = new URL(req.url);
