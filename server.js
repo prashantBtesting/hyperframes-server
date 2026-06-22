@@ -37,25 +37,64 @@ async function handleFFmpegCut(req) {
   const outPath   = join(CUT_DIR, `${id}_cut.mp4`);
 
   try {
-    // 1. Download source video
+    // 1. Download source video — handle Google Drive large-file confirmation
     console.log(`[Cut ${id}] Downloading: ${videoUrl}`);
-    await $`curl -L --max-time 120 -o ${inputPath} ${videoUrl}`.quiet();
+    const cookieFile = join(CUT_DIR, `${id}_cookies.txt`);
+    if (videoUrl.includes('drive.google.com')) {
+      // Step 1: hit URL to collect cookies + possible confirm token
+      const initHtml = await $`curl -s -c ${cookieFile} -L ${videoUrl}`.text();
+      const confirmMatch = initHtml.match(/confirm=([^&"'\s]+)/);
+      const idMatch = videoUrl.match(/id=([^&]+)/);
+      if (confirmMatch && idMatch) {
+        const dlUrl = `https://drive.google.com/uc?export=download&confirm=${confirmMatch[1]}&id=${idMatch[1]}`;
+        console.log(`[Cut ${id}] Using confirm token: ${confirmMatch[1]}`);
+        await $`curl -L -b ${cookieFile} --max-time 180 -o ${inputPath} ${dlUrl}`.quiet();
+      } else {
+        await $`curl -L -b ${cookieFile} --max-time 180 -o ${inputPath} ${videoUrl}`.quiet();
+      }
+    } else {
+      await $`curl -L --max-time 180 -o ${inputPath} ${videoUrl}`.quiet();
+    }
 
-    // 2. Build FFmpeg filter_complex for segment concat
+    // Verify download is actually a video (not an HTML error page)
+    const fileType = await $`file --mime-type -b ${inputPath}`.text();
+    console.log(`[Cut ${id}] Downloaded file type: ${fileType.trim()}`);
+    if (fileType.includes('text/html') || fileType.includes('text/plain')) {
+      throw new Error(`Downloaded file is HTML not video — Google Drive auth issue. MIME: ${fileType.trim()}`);
+    }
+
+    // 2. Probe for audio stream
+    let hasAudio = false;
+    try {
+      const probe = await $`ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=noprint_wrappers=1 ${inputPath}`.text();
+      hasAudio = probe.trim().length > 0;
+    } catch { hasAudio = false; }
+    console.log(`[Cut ${id}] Has audio: ${hasAudio}`);
+
+    // 3. Build FFmpeg filter_complex
     const filterParts = [];
     let concatInputs  = '';
     for (let i = 0; i < segments.length; i++) {
       const { start, end } = segments[i];
       filterParts.push(`[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v${i}]`);
-      filterParts.push(`[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[a${i}]`);
-      concatInputs += `[v${i}][a${i}]`;
+      if (hasAudio) {
+        filterParts.push(`[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[a${i}]`);
+        concatInputs += `[v${i}][a${i}]`;
+      } else {
+        concatInputs += `[v${i}]`;
+      }
     }
-    filterParts.push(`${concatInputs}concat=n=${segments.length}:v=1:a=1[vout][aout]`);
+    const aFlag = hasAudio ? ':a=1' : ':a=0';
+    filterParts.push(`${concatInputs}concat=n=${segments.length}:v=1${aFlag}[vout]${hasAudio ? '[aout]' : ''}`);
     const filter = filterParts.join(';');
 
-    // 3. Run FFmpeg
-    console.log(`[Cut ${id}] FFmpeg: ${segments.length} segments`);
-    await $`ffmpeg -y -i ${inputPath} -filter_complex ${filter} -map [vout] -map [aout] -c:v libx264 -preset fast -crf 22 -c:a aac -b:a 128k ${outPath}`.quiet();
+    // 4. Run FFmpeg (no .quiet() so errors appear in Railway logs)
+    console.log(`[Cut ${id}] FFmpeg: ${segments.length} segments, audio=${hasAudio}`);
+    if (hasAudio) {
+      await $`ffmpeg -y -i ${inputPath} -filter_complex ${filter} -map [vout] -map [aout] -c:v libx264 -preset fast -crf 22 -c:a aac -b:a 128k ${outPath}`;
+    } else {
+      await $`ffmpeg -y -i ${inputPath} -filter_complex ${filter} -map [vout] -c:v libx264 -preset fast -crf 22 -an ${outPath}`;
+    }
 
     // 4. Cleanup input
     try { unlinkSync(inputPath); } catch {}
