@@ -131,9 +131,9 @@ jobs:
             vw = int(dims[0]) if dims and dims[0] else 1080
             vh = int(dims[1]) if len(dims) > 1 and dims[1] else 1920
 
-            fs = max(28, int(vw * 0.042))   # ~45px on 1080p
-            cy = int(vh * 0.80)              # 80% down the frame
-            bw = max(8, int(fs * 0.3))
+            fs = max(56, int(vw * 0.065))   # ~70px on 1080p (viral size)
+            cy = int(vh * 0.82)              # 82% down — caption zone
+            bw = max(4, int(fs * 0.08))     # outline thickness
 
             def esc(t):
               return (t or '').replace('\\', '\\\\').replace("'", "\\'") \
@@ -141,9 +141,11 @@ jobs:
                               .replace(']', '\\]').replace(',', '\\,') \
                               .replace(';', '\\;').replace('\n', ' ').strip()
 
+            # Viral style: bold white text with black outline (no box bg)
             vf = ','.join(
               f"drawtext=fontsize={fs}:fontcolor=white:text='{esc(c['text'])}'"
-              f":x=(w-text_w)/2:y={cy}:box=1:boxcolor=black@0.75:boxborderw={bw}"
+              f":x=(w-text_w)/2:y={cy}"
+              f":borderw={bw}:bordercolor=black@0.95"
               f":enable='between(t\\,{c['start']}\\,{c['end']})'"
               for c in cap_list
             )
