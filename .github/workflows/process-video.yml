@@ -61,7 +61,15 @@ jobs:
           fi
           echo "Download complete: $(du -sh input.mp4 | cut -f1)"
 
-      # ── 2. FFmpeg: cut segments + burn captions ───────────────────────────
+      # ── 2. Install FFmpeg ─────────────────────────────────────────────────
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -y -q
+          sudo apt-get install -y -q ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      # ── 3. FFmpeg: cut segments + burn captions ───────────────────────────
       - name: Process video with FFmpeg
         env:
           SEGMENTS: ${{ inputs.segments }}
