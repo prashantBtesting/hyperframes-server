@@ -164,19 +164,23 @@ jobs:
           print(f"Output size: {size / 1024 / 1024:.1f} MB")
           PYEOF
 
-      # ── 3. Upload to transfer.sh (free temp storage, 14-day retention) ────
+      # ── 3. Upload to litterbox.catbox.moe (free, 72h retention) ─────────
       - name: Upload processed video
         id: upload
         run: |
           FILENAME="edited_${{ inputs.filename }}"
-          echo "Uploading $FILENAME to transfer.sh..."
-          TEMP_URL=$(curl --upload-file output.mp4 \
-            "https://transfer.sh/${FILENAME}" \
-            --max-time 300 \
-            --progress-bar)
+          echo "Uploading ${FILENAME}..."
+
+          TEMP_URL=$(curl -s \
+            -F "reqtype=fileupload" \
+            -F "time=72h" \
+            -F "fileToUpload=@output.mp4" \
+            "https://litterbox.catbox.moe/resources/internals/api.php" \
+            --max-time 300)
+
+          echo "Uploaded: $TEMP_URL"
           echo "temp_url=${TEMP_URL}" >> $GITHUB_OUTPUT
           echo "filename=${FILENAME}"  >> $GITHUB_OUTPUT
-          echo "Uploaded: $TEMP_URL"
 
       # ── 4. Notify n8n to resume workflow ──────────────────────────────────
       - name: Notify n8n webhook
