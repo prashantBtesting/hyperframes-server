@@ -49,7 +49,7 @@ jobs:
           CAPTIONS: ${{ github.event.inputs.captions }}
         run: |
           python3 << 'PYTHON'
-          import json, os, subprocess, sys
+          import json, os, re, subprocess, sys
 
           segments = json.loads(os.environ['SEGMENTS'])
           captions  = json.loads(os.environ['CAPTIONS'])
@@ -58,44 +58,115 @@ jobs:
               print("ERROR: No segments provided")
               sys.exit(1)
 
-          print(f"Processing {len(segments)} segments, {len(captions)} captions")
-
-          # ── Probe video dimensions ────────────────────────────────────────
+          # ── Probe video ───────────────────────────────────────────────────
           probe = subprocess.run(
-              ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', 'source_video.mp4'],
+              ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+               '-show_streams', '-show_format', 'source_video.mp4'],
               capture_output=True, text=True, check=True
           )
-          streams = json.loads(probe.stdout)['streams']
-          vstream = next(s for s in streams if s['codec_type'] == 'video')
-          vw, vh = int(vstream['width']), int(vstream['height'])
-          has_audio = any(s['codec_type'] == 'audio' for s in streams)
-          print(f"Video: {vw}x{vh}, audio={'yes' if has_audio else 'no'}")
+          probe_data = json.loads(probe.stdout)
+          streams    = probe_data['streams']
+          vstream    = next(s for s in streams if s['codec_type'] == 'video')
+          vw, vh     = int(vstream['width']), int(vstream['height'])
+          has_audio  = any(s['codec_type'] == 'audio' for s in streams)
+          total_dur  = float(probe_data['format']['duration'])
+          print(f"Video: {vw}x{vh}  duration={total_dur:.1f}s  audio={'yes' if has_audio else 'no'}")
+          print(f"Segments from n8n: {len(segments)}  captions: {len(captions)}")
+
+          # ── Silence detection ─────────────────────────────────────────────
+          # Finds real silence regions by audio dB level, not word timestamps.
+          # noise=-35dB : anything quieter than -35 dB = silence
+          # d=0.2       : silence must last at least 200ms to count
+          audio_segs = []
+          if has_audio:
+              print("Running silencedetect...")
+              sd = subprocess.run(
+                  ['ffmpeg', '-i', 'source_video.mp4',
+                   '-af', 'silencedetect=noise=-35dB:d=0.2',
+                   '-f', 'null', '-'],
+                  capture_output=True, text=True
+              )
+              sil_starts = [float(x) for x in re.findall(r'silence_start: (-?\d+\.?\d*)', sd.stderr)]
+              sil_ends   = [float(x) for x in re.findall(r'silence_end: (-?\d+\.?\d*)',   sd.stderr)]
+              if len(sil_starts) > len(sil_ends):
+                  sil_ends.append(total_dur)
+              prev = 0.0
+              for ss, se in zip(sil_starts, sil_ends):
+                  if ss - prev >= 0.3:
+                      audio_segs.append({'start': round(prev, 3), 'end': round(ss, 3)})
+                  prev = se
+              if total_dur - prev >= 0.3:
+                  audio_segs.append({'start': round(prev, 3), 'end': round(total_dur, 3)})
+              print(f"Audio-active regions: {len(audio_segs)}")
+          else:
+              audio_segs = [{'start': 0.0, 'end': total_dur}]
+
+          # ── Intersect word-segments with audio regions ────────────────────
+          # Word-segments = filler removal + best-take selection (from n8n)
+          # Audio regions = actual sound presence (from silencedetect above)
+          # Result: keep only parts where BOTH agree — precise and clean
+          def intersect(word_segs, aud_segs, min_overlap=0.15):
+              result = []
+              for ws in word_segs:
+                  for au in aud_segs:
+                      start = max(ws['start'], au['start'])
+                      end   = min(ws['end'],   au['end'])
+                      if end - start >= min_overlap:
+                          result.append({'start': round(start, 3), 'end': round(end, 3)})
+              result.sort(key=lambda x: x['start'])
+              merged = []
+              for seg in result:
+                  if merged and seg['start'] - merged[-1]['end'] < 0.08:
+                      merged[-1]['end'] = max(merged[-1]['end'], seg['end'])
+                  else:
+                      merged.append(seg)
+              return merged
+
+          final_segs = intersect(segments, audio_segs)
+          if not final_segs:
+              print("WARNING: Intersection empty — falling back to word-segments")
+              final_segs = segments
+
+          kept = sum(s['end'] - s['start'] for s in final_segs)
+          print(f"Final segments: {len(final_segs)}  keeping {kept:.1f}s / {total_dur:.1f}s ({100*kept/total_dur:.0f}%)")
 
           # ── Build filter_complex ──────────────────────────────────────────
-          n = len(segments)
-          parts = []
+          n           = len(final_segs)
+          parts       = []
+          output_dur  = kept
+          fade_dur    = round(min(0.3, output_dur * 0.05), 3)
+          fade_out_st = round(output_dur - fade_dur, 3)
 
-          for i, seg in enumerate(segments):
+          # Trim each segment
+          for i, seg in enumerate(final_segs):
               s, e = seg['start'], seg['end']
               parts.append(f"[0:v]trim=start={s}:end={e},setpts=PTS-STARTPTS[v{i}]")
               if has_audio:
                   parts.append(f"[0:a]atrim=start={s}:end={e},asetpts=PTS-STARTPTS[a{i}]")
 
+          # Video concat
+          v_in = ''.join(f'[v{i}]' for i in range(n))
+          parts.append(f"{v_in}concat=n={n}:v=1:a=0[vcat]")
+
+          # Audio: 25ms acrossfade at every cut point
+          # Triangle window (tri) — smoothest curve for voice
+          # Makes cuts sound invisible instead of hard-spliced
           if has_audio:
-              concat_in = ''.join(f'[v{i}][a{i}]' for i in range(n))
-              parts.append(f"{concat_in}concat=n={n}:v=1:a=1[vcat][acat]")
-          else:
-              concat_in = ''.join(f'[v{i}]' for i in range(n))
-              parts.append(f"{concat_in}concat=n={n}:v=1:a=0[vcat]")
+              if n == 1:
+                  parts.append("[a0]anull[acat]")
+              elif n == 2:
+                  parts.append("[a0][a1]acrossfade=d=0.025:c1=tri:c2=tri[acat]")
+              else:
+                  parts.append("[a0][a1]acrossfade=d=0.025:c1=tri:c2=tri[af1]")
+                  for i in range(2, n):
+                      in_lbl  = f"af{i-1}"
+                      out_lbl = "acat" if i == n - 1 else f"af{i}"
+                      parts.append(f"[{in_lbl}][a{i}]acrossfade=d=0.025:c1=tri:c2=tri[{out_lbl}]")
 
-          # ── Caption drawtext filters ──────────────────────────────────────
-          fs   = 54
-          cy   = int(vh * 0.80)
-          bpad = 18
-
+          # Captions
           def esc(t):
               t = t.replace('\\', '\\\\')
-              t = t.replace("'", "’")   # curly apostrophe — safe in drawtext
+              t = t.replace("'", "’")
               t = t.replace(':', '\\:')
               t = t.replace('[', '\\[')
               t = t.replace(']', '\\]')
@@ -103,6 +174,7 @@ jobs:
               t = t.replace(';', '\\;')
               return t
 
+          fs, cy, bpad = 54, int(vh * 0.80), 18
           dt_filters = [
               f"drawtext=fontsize={fs}:fontcolor=white:text='{esc(c['text'])}'"
               f":x=(w-text_w)/2:y={cy}"
@@ -110,11 +182,14 @@ jobs:
               f":enable='between(t,{c['start']},{c['end']})'"
               for c in captions
           ]
+          caption_chain = ','.join(dt_filters) + ',' if dt_filters else ''
 
-          if dt_filters:
-              parts.append('[vcat]' + ','.join(dt_filters) + '[vout]')
-          else:
-              parts.append('[vcat]copy[vout]')
+          # Video: captions + fade in/out only
+          parts.append(
+              f"[vcat]{caption_chain}"
+              f"fade=t=in:st=0:d={fade_dur},"
+              f"fade=t=out:st={fade_out_st}:d={fade_dur}[vout]"
+          )
 
           filter_complex = ';'.join(parts)
 
@@ -140,7 +215,7 @@ jobs:
               sys.exit(1)
 
           size_mb = os.path.getsize('output_video.mp4') / 1024 / 1024
-          print(f"Output: {size_mb:.1f} MB — done!")
+          print(f"Done! Output: {size_mb:.1f} MB")
           PYTHON
 
       - name: Upload processed video
