@@ -83,7 +83,7 @@ jobs:
               print("Running silencedetect (threshold: 0.5s)...")
               sd = subprocess.run(
                   ['ffmpeg', '-i', 'source_video.mp4',
-                   '-af', 'silencedetect=noise=-35dB:d=0.5',
+                   '-af', 'silencedetect=noise=-30dB:d=0.5',
                    '-f', 'null', '-'],
                   capture_output=True, text=True
               )
@@ -192,11 +192,18 @@ jobs:
               t = t.replace(';', '\\;')
               return t
 
-          fs, cy, bpad = 54, int(vh * 0.80), 18
+          # Instagram/Reels-style: large text, bottom center, above UI chrome
+          # y = bottom of frame  minus  text height  minus  box padding  minus  safe margin
+          # Scales with video height so it works for both portrait (1920) and landscape (1080)
+          fs         = max(68, int(vh * 0.045))   # ~86px on 1920, ~68px on 1080
+          bpad       = 22                          # box padding around text
+          bot_margin = max(50, int(vh * 0.06))     # distance from bottom edge (~115px on 1920)
+          y_expr     = f"h-text_h-{bpad}-{bot_margin}"
+
           dt_filters = [
               f"drawtext=fontsize={fs}:fontcolor=white:text='{esc(c['text'])}'"
-              f":x=(w-text_w)/2:y={cy}"
-              f":box=1:boxcolor=black@0.80:boxborderw={bpad}"
+              f":x=(w-text_w)/2:y={y_expr}"
+              f":box=1:boxcolor=black@0.75:boxborderw={bpad}"
               f":enable='between(t,{c['start']},{c['end']})'"
               for c in captions
           ]
