@@ -18,6 +18,14 @@ on:
       webhook_url:
         description: 'n8n resume webhook URL'
         required: true
+      overlay_text:
+        description: 'Text card to show (black screen, slides in from left). Leave empty to skip.'
+        required: false
+        default: ''
+      overlay_position:
+        description: 'Where to place the text card: start or end'
+        required: false
+        default: 'start'
 
 jobs:
   process-video:
@@ -249,6 +257,136 @@ jobs:
 
           size_mb = os.path.getsize('output_video.mp4') / 1024 / 1024
           print(f"Done! Output: {size_mb:.1f} MB")
+          PYTHON
+
+      - name: Create text overlay card
+        if: ${{ github.event.inputs.overlay_text != '' }}
+        env:
+          OVERLAY_TEXT: ${{ github.event.inputs.overlay_text }}
+          OVERLAY_POSITION: ${{ github.event.inputs.overlay_position }}
+        run: |
+          python3 << 'PYTHON'
+          import json, os, subprocess, sys
+
+          text     = os.environ.get('OVERLAY_TEXT', '').strip()
+          position = os.environ.get('OVERLAY_POSITION', 'start').strip()
+
+          if not text:
+              print("No overlay text — skipping card")
+              sys.exit(0)
+
+          print(f"Creating overlay card: '{text}' at position={position}")
+
+          # ── Get dimensions from already-processed video ───────────────────
+          probe = subprocess.run(
+              ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+               '-show_streams', '-show_format', 'output_video.mp4'],
+              capture_output=True, text=True, check=True
+          )
+          data    = json.loads(probe.stdout)
+          streams = data['streams']
+          vs      = next(s for s in streams if s['codec_type'] == 'video')
+          w, h    = int(vs['width']), int(vs['height'])
+          fps     = vs.get('r_frame_rate', '30/1')
+
+          # ── Font ──────────────────────────────────────────────────────────
+          fc = subprocess.run(
+              ['fc-match', 'DejaVu Sans:bold', '--format=%{file}'],
+              capture_output=True, text=True
+          )
+          font = fc.stdout.strip() or '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+          print(f"Font: {font}")
+
+          # ── Text size + position ─────────────────────────────────────────
+          fs = max(80, h // 14)   # ~137px on 1920px tall video
+          bpad = 30
+
+          # ── Escape text for FFmpeg drawtext ───────────────────────────────
+          safe = (text
+              .replace('\\', '\\\\')
+              .replace("'", "’")
+              .replace(':', '\\:')
+              .replace('[', '\\[')
+              .replace(']', '\\]')
+              .replace(',', '\\,')
+              .replace(';', '\\;')
+          )
+
+          # ── Slide-in from left animation ──────────────────────────────────
+          # t=0.00 : text fully off-screen left  (x = -text_w)
+          # t=0.60 : text fully centered          (x = (w-text_w)/2)
+          # t>0.60 : holds at center
+          # Formula: start_x + (end_x - start_x) * progress
+          #   start_x = -text_w
+          #   end_x   = (w-text_w)/2
+          #   delta   = (w+text_w)/2
+          x_anim = "if(lt(t\\,0.6)\\,-text_w+((w+text_w)/2)*t/0.6\\,(w-text_w)/2)"
+          y_center = "(h-text_h)/2"
+
+          filter_str = (
+              f"[0:v]"
+              f"drawtext="
+              f"fontfile='{font}':"
+              f"fontsize={fs}:"
+              f"fontcolor=white:"
+              f"text='{safe}':"
+              f"x={x_anim}:"
+              f"y={y_center}:"
+              f"box=1:boxcolor=black@0.0:boxborderw={bpad},"  # invisible box = clean padding
+              f"fade=t=in:st=0:d=0.3,"
+              f"fade=t=out:st=2.5:d=0.5"
+              f"[vcard];"
+              f"[1:a]afade=t=out:st=2.5:d=0.5[acard]"
+          )
+
+          # ── Render 3-second black card ────────────────────────────────────
+          cmd_card = [
+              'ffmpeg', '-y', '-threads', '2',
+              '-f', 'lavfi', '-t', '3.0',
+              '-i', f'color=c=black:size={w}x{h}:rate={fps}',
+              '-f', 'lavfi', '-t', '3.0',
+              '-i', 'aevalsrc=0:c=stereo:r=44100',
+              '-filter_complex', filter_str,
+              '-map', '[vcard]', '-map', '[acard]',
+              '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+              '-c:a', 'aac', '-b:a', '128k',
+              'overlay_card.mp4'
+          ]
+          print("Rendering text card...")
+          with open('card_stderr.txt', 'w') as ef:
+              ret = subprocess.call(cmd_card, stderr=ef)
+          if ret != 0:
+              with open('card_stderr.txt') as f:
+                  print(f.read()[-2000:])
+              sys.exit(1)
+          print("Card rendered OK")
+
+          # ── Concatenate card + main video (or reverse) ────────────────────
+          if position == 'end':
+              order = ['output_video.mp4', 'overlay_card.mp4']
+          else:
+              order = ['overlay_card.mp4', 'output_video.mp4']
+
+          with open('concat_list.txt', 'w') as f:
+              for fn in order:
+                  f.write(f"file '{fn}'\n")
+
+          print(f"Concat order: {' → '.join(order)}")
+          with open('concat_stderr.txt', 'w') as ef:
+              ret2 = subprocess.call(
+                  ['ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                   '-i', 'concat_list.txt', '-fflags', '+genpts',
+                   '-c', 'copy', 'final_video.mp4'],
+                  stderr=ef
+              )
+          if ret2 != 0:
+              with open('concat_stderr.txt') as f:
+                  print(f.read()[-2000:])
+              sys.exit(1)
+
+          os.rename('final_video.mp4', 'output_video.mp4')
+          size_mb = os.path.getsize('output_video.mp4') / 1024 / 1024
+          print(f"Overlay added! Final size: {size_mb:.1f} MB")
           PYTHON
 
       - name: Upload processed video
