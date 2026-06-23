@@ -148,7 +148,7 @@ jobs:
           FILENAME="${{ github.event.inputs.filename }}"
           echo "Uploading edited_${FILENAME}..."
 
-          UPLOAD_RESPONSE=$(curl -s \
+          UPLOAD_RESPONSE=$(curl -s -k \
             -F "reqtype=fileupload" \
             -F "time=72h" \
             -F "fileToUpload=@output_video.mp4;filename=edited_${FILENAME}" \
