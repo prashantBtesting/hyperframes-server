@@ -199,7 +199,9 @@ jobs:
               map_args += ['-map', '[acat]']
 
           cmd = [
-              'ffmpeg', '-y', '-i', 'source_video.mp4',
+              'ffmpeg', '-y',
+              '-threads', '2',          # cap CPU threads → lower memory pressure
+              '-i', 'source_video.mp4',
               '-filter_complex', filter_complex,
               *map_args,
               '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
@@ -208,10 +210,16 @@ jobs:
           ]
 
           print("Running FFmpeg...")
-          result = subprocess.run(cmd, capture_output=True, text=True)
-          if result.returncode != 0:
-              print("FFmpeg STDERR (last 3000 chars):")
-              print(result.stderr[-3000:])
+          # Write stderr to file — NOT capture_output=True.
+          # capture_output buffers every frame-progress line in RAM → OOM → SIGTERM on large files.
+          with open('ffmpeg_stderr.txt', 'w') as err_f:
+              ret = subprocess.call(cmd, stderr=err_f)
+
+          if ret != 0:
+              print(f"FFmpeg failed (exit {ret}). Last 3000 chars of stderr:")
+              with open('ffmpeg_stderr.txt') as f:
+                  content = f.read()
+              print(content[-3000:])
               sys.exit(1)
 
           size_mb = os.path.getsize('output_video.mp4') / 1024 / 1024
