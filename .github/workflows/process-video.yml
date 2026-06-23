@@ -74,15 +74,16 @@ jobs:
           print(f"Segments from n8n: {len(segments)}  captions: {len(captions)}")
 
           # ── Silence detection ─────────────────────────────────────────────
-          # Finds real silence regions by audio dB level, not word timestamps.
-          # noise=-35dB : anything quieter than -35 dB = silence
-          # d=0.2       : silence must last at least 200ms to count
+          # noise=-35dB : quieter than -35 dB = silence
+          # d=0.5       : only silences LONGER than 0.5s are cut.
+          #               Short pauses (≤ 0.5s) are left completely intact.
+          LEAD_IN = 0.5   # seconds of silence to preserve before each speech burst
           audio_segs = []
           if has_audio:
-              print("Running silencedetect...")
+              print("Running silencedetect (threshold: 0.5s)...")
               sd = subprocess.run(
                   ['ffmpeg', '-i', 'source_video.mp4',
-                   '-af', 'silencedetect=noise=-35dB:d=0.2',
+                   '-af', 'silencedetect=noise=-35dB:d=0.5',
                    '-f', 'null', '-'],
                   capture_output=True, text=True
               )
@@ -90,36 +91,53 @@ jobs:
               sil_ends   = [float(x) for x in re.findall(r'silence_end: (-?\d+\.?\d*)',   sd.stderr)]
               if len(sil_starts) > len(sil_ends):
                   sil_ends.append(total_dur)
+
               prev = 0.0
               for ss, se in zip(sil_starts, sil_ends):
-                  if ss - prev >= 0.3:
+                  # Speech segment from prev → ss (all detected silences are >= 0.5s)
+                  if ss - prev >= 0.1:
                       audio_segs.append({'start': round(prev, 3), 'end': round(ss, 3)})
-                  prev = se
-              if total_dur - prev >= 0.3:
+                  # Next speech starts 0.5s BEFORE the silence ends (lead-in buffer)
+                  # This keeps natural breath / room tone before each sentence
+                  prev = round(max(ss, se - LEAD_IN), 3)
+
+              # Final segment after last silence — includes end-of-video tail naturally
+              if total_dur - prev >= 0.1:
                   audio_segs.append({'start': round(prev, 3), 'end': round(total_dur, 3)})
+
               print(f"Audio-active regions: {len(audio_segs)}")
+              for s in audio_segs:
+                  print(f"  [{s['start']:.2f} → {s['end']:.2f}]  ({s['end']-s['start']:.2f}s)")
           else:
               audio_segs = [{'start': 0.0, 'end': total_dur}]
 
-          # ── Intersect word-segments with audio regions ────────────────────
+          # ── Gate word-segments against audio regions ──────────────────────
           # Word-segments = filler removal + best-take selection (from n8n)
-          # Audio regions = actual sound presence (from silencedetect above)
-          # Result: keep only parts where BOTH agree — precise and clean
-          def intersect(word_segs, aud_segs, min_overlap=0.15):
-              result = []
-              for ws in word_segs:
+          # Audio regions = confirmed speech zones (from silencedetect above)
+          #
+          # IMPORTANT: we check for overlap but keep the FULL word-segment bounds.
+          # Old approach clipped words to audio boundaries → chopped first/last
+          # syllables. Now: if any part of a word overlaps with a speech zone,
+          # keep the whole word untouched.
+          def intersect(word_segs, aud_segs, min_overlap=0.05):
+              kept_segs = []
+              seen = set()
+              for i, ws in enumerate(word_segs):
                   for au in aud_segs:
-                      start = max(ws['start'], au['start'])
-                      end   = min(ws['end'],   au['end'])
-                      if end - start >= min_overlap:
-                          result.append({'start': round(start, 3), 'end': round(end, 3)})
-              result.sort(key=lambda x: x['start'])
+                      ol_s = max(ws['start'], au['start'])
+                      ol_e = min(ws['end'],   au['end'])
+                      if ol_e - ol_s >= min_overlap and i not in seen:
+                          kept_segs.append({'start': ws['start'], 'end': ws['end']})
+                          seen.add(i)
+                          break
+              kept_segs.sort(key=lambda x: x['start'])
+              # Merge segments that are ≤ 80ms apart
               merged = []
-              for seg in result:
-                  if merged and seg['start'] - merged[-1]['end'] < 0.08:
+              for seg in kept_segs:
+                  if merged and seg['start'] - merged[-1]['end'] <= 0.08:
                       merged[-1]['end'] = max(merged[-1]['end'], seg['end'])
                   else:
-                      merged.append(seg)
+                      merged.append(dict(seg))
               return merged
 
           final_segs = intersect(segments, audio_segs)
