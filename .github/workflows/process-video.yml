@@ -33,23 +33,43 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Download source video
-        run: |
-          pip install gdown --quiet
-          FILE_ID=$(echo "${{ github.event.inputs.video_url }}" | grep -oP '(?<=id=)[^&]+')
-          echo "Downloading file ID: $FILE_ID"
-          gdown "$FILE_ID" -O source_video.mp4
-          if [ ! -s source_video.mp4 ]; then
-            echo "ERROR: Download failed or file is empty"
-            exit 1
-          fi
-          echo "Downloaded: $(du -h source_video.mp4)"
-
       - name: Install FFmpeg
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
           ffmpeg -version | head -1
+
+      - name: Download source video
+        run: |
+          pip install gdown --quiet
+          FILE_ID=$(echo "${{ github.event.inputs.video_url }}" | grep -oP '(?<=id=)[^&]+')
+          echo "Downloading file ID: $FILE_ID"
+          gdown "$FILE_ID" -O source_raw
+          if [ ! -s source_raw ]; then
+            echo "ERROR: Download failed or file is empty"
+            exit 1
+          fi
+          echo "Downloaded: $(du -h source_raw)"
+
+      - name: Normalize to H.264
+        run: |
+          CODEC=$(ffprobe -v quiet -select_streams v:0 \
+            -show_entries stream=codec_name -of csv=p=0 source_raw 2>/dev/null || echo "unknown")
+          HEIGHT=$(ffprobe -v quiet -select_streams v:0 \
+            -show_entries stream=height -of csv=p=0 source_raw 2>/dev/null || echo "0")
+          echo "Source codec: $CODEC  height: ${HEIGHT}px"
+
+          # Always normalize: convert HEVC/MOV/4K → H.264 1080p max
+          # This prevents OOM when FFmpeg tries to decode H.265 during editing
+          echo "Normalizing to H.264 (max 1080p)..."
+          ffmpeg -y -threads 2 \
+            -i source_raw \
+            -c:v libx264 -preset ultrafast -crf 26 \
+            -vf "scale='if(gt(iw\,1920)\,1920\,iw)':'if(gt(ih\,1080)\,1080\,ih)':force_original_aspect_ratio=decrease" \
+            -c:a aac -b:a 128k \
+            source_video.mp4
+          echo "Normalized: $(du -h source_video.mp4)"
+          rm source_raw
 
       - name: Process video with FFmpeg
         env:
